@@ -1,0 +1,10 @@
+[project]
+name = "opencode-migrate"
+version = "0.1.0"
+description = "Migrate SQLite OpenCode DB to pgembed PostgreSQL"
+dependencies = [
+    "pgembed",
+    "sqlalchemy",
+    "sqlalchemy-utils",
+    "psycopg2-binary"
+]
