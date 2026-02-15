@@ -6,8 +6,113 @@ import sqlalchemy as sa
 from sqlalchemy_utils import database_exists, create_database
 from sqlalchemy.dialects.postgresql import JSONB
 
+# Import duckdb for archiving partitions
+import duckdb
 
-def migrate_sqlite_to_pgembed(sqlite_path, pgdata_path):
+
+def migrate_partitions_to_archive(
+    pg_engine,
+    partitioned_tables,
+    pgdata_path,
+    age_days=90,
+    archive_dir="duckdb_archive",
+    archive_format="vortex",
+):
+    """Migrate partitions older than age_days to archive files via DuckDB postgres scanner."""
+    import pathlib
+
+    archive_format = archive_format.lower()
+    supported_formats = {"vortex", "lance", "parquet"}
+    if archive_format not in supported_formats:
+        raise ValueError(
+            f"Unsupported archive format '{archive_format}'. Expected one of: {sorted(supported_formats)}"
+        )
+
+    # Store archive output inside pgdata dir
+    archive_dir = os.path.join(pgdata_path, archive_dir)
+
+    # Ensure archive directory exists
+    pathlib.Path(archive_dir).mkdir(parents=True, exist_ok=True)
+
+    cutoff_date = datetime.datetime.now() - datetime.timedelta(days=age_days)
+
+    # pgembed uses Unix socket and 'postgres' user (as shown in start_db.py line 22)
+    pg_db = "opencode"
+    pg_user = "postgres"
+    socket_dir = os.path.abspath(pgdata_path)
+
+    with pg_engine.connect() as conn:
+        for table_name in partitioned_tables:
+            print(f"Checking partitions for {table_name}...")
+
+            # Get all partitions for this table
+            result = conn.execute(sa.text(f"""
+                SELECT inhrelid::regclass::text as partition_name,
+                       pg_get_expr(relpartbound, inhrelid) as bounds
+                FROM pg_inherits
+                JOIN pg_class ON pg_class.oid = inhrelid
+                WHERE inhparent = '{table_name}'::regclass
+            """))
+            partitions = result.fetchall()
+
+            for partition_name, bounds in partitions:
+                # Skip default partition
+                if "DEFAULT" in (bounds or "").upper():
+                    continue
+
+                # Parse partition bounds to find date range
+                import re
+
+                date_match = re.search(r"FROM \('(\d{4}-\d{2}-\d{2})", bounds or "")
+                if date_match:
+                    partition_start = datetime.datetime.strptime(
+                        date_match.group(1), "%Y-%m-%d"
+                    )
+
+                    # If partition is older than cutoff, migrate to archive file format
+                    if partition_start < cutoff_date:
+                        archive_file = os.path.abspath(
+                            f"{archive_dir}/{partition_name}.{archive_format}"
+                        )
+                        print(
+                            f"  Migrating {partition_name} to {archive_file} (format={archive_format})"
+                        )
+
+                        # Use in-memory duckdb session to export partition directly to archive file
+                        ddb = duckdb.connect()
+
+                        # Install and load postgres scanner
+                        ddb.execute("INSTALL postgres;")
+                        ddb.execute("LOAD postgres;")
+                        if archive_format in {"vortex", "lance"}:
+                            ddb.execute(f"INSTALL {archive_format};")
+                            ddb.execute(f"LOAD {archive_format};")
+
+                        # Attach PostgreSQL using Unix socket and write partition to archive file
+                        ddb.execute(f"""
+                            ATTACH 'dbname={pg_db} user={pg_user} host={socket_dir}' AS pg (TYPE postgres);
+                            COPY (
+                                SELECT * FROM pg.{partition_name}
+                            ) TO '{archive_file}' (FORMAT {archive_format})
+                        """)
+
+                        ddb.close()
+
+                        # Detach and drop original partition after successful migration
+                        conn.execute(sa.text(f"""
+                            ALTER TABLE {table_name} DETACH PARTITION {partition_name}
+                        """))
+                        conn.execute(sa.text(f"DROP TABLE {partition_name}"))
+
+                        print(f"    Migrated and removed {partition_name}")
+
+        # Run checkpoint on PostgreSQL after all migrations are done
+        conn.execute(sa.text("CHECKPOINT;"))
+
+
+def migrate_sqlite_to_pgembed(
+    sqlite_path, pgdata_path, duckdb_age_days=None, archive_format="vortex"
+):
     # Connect to SQLite
     sqlite_engine = sa.create_engine(f"sqlite:///{sqlite_path}")
 
@@ -76,7 +181,49 @@ def migrate_sqlite_to_pgembed(sqlite_path, pgdata_path):
                     ) PARTITION BY RANGE (time_created)"""
                     conn.execute(sa.text(create_sql))
 
-                    # Create default partition
+                    # Get date range from SQLite data
+                    with sqlite_engine.connect() as sqlite_conn:
+                        min_max_result = sqlite_conn.execute(
+                            sa.text(
+                                f"SELECT MIN(time_created), MAX(time_created) FROM {table_name}"
+                            )
+                        ).fetchone()
+                        min_ts, max_ts = min_max_result
+
+                    if min_ts is not None and max_ts is not None:
+                        # Convert from milliseconds to datetime
+                        min_date = datetime.datetime.fromtimestamp(min_ts / 1000.0)
+                        max_date = datetime.datetime.fromtimestamp(max_ts / 1000.0)
+
+                        # Create daily partitions
+                        current = min_date.replace(
+                            hour=0, minute=0, second=0, microsecond=0
+                        )
+                        end_date = max_date.replace(
+                            hour=0, minute=0, second=0, microsecond=0
+                        )
+
+                        while current <= end_date:
+                            next_day = current + datetime.timedelta(days=1)
+
+                            partition_name = (
+                                f"{table_name}_{current.strftime('%Y_%m_%d')}"
+                            )
+                            start_str = current.strftime("%Y-%m-%d")
+                            end_str = next_day.strftime("%Y-%m-%d")
+
+                            conn.execute(sa.text(f"""
+                                CREATE TABLE {partition_name}
+                                PARTITION OF {table_name}
+                                FOR VALUES FROM ('{start_str}') TO ('{end_str}')
+                            """))
+                            print(
+                                f"  Created partition: {partition_name} ({start_str} to {end_str})"
+                            )
+
+                            current = next_day
+
+                    # Create default partition for any data outside the range
                     conn.execute(sa.text(f"""CREATE TABLE {table_name}_default
                         PARTITION OF {table_name} DEFAULT"""))
 
@@ -141,6 +288,19 @@ def migrate_sqlite_to_pgembed(sqlite_path, pgdata_path):
                     print("  No data to migrate")
         print("Migration completed successfully.")
 
+        # Optionally migrate older partitions to archive files
+        if duckdb_age_days:
+            print(
+                f"\nMigrating partitions older than {duckdb_age_days} days to {archive_format}..."
+            )
+            migrate_partitions_to_archive(
+                pg_engine,
+                partitioned_tables,
+                pgdata_path,
+                duckdb_age_days,
+                archive_format=archive_format,
+            )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -151,6 +311,28 @@ if __name__ == "__main__":
         default="pgdata",
         help="Path to pgembed data directory (default: pgdata)",
     )
+    parser.add_argument(
+        "--duckdb-age-days",
+        type=int,
+        default=1,
+        help="Migrate partitions older than N days to archive files",
+    )
+    format_group = parser.add_mutually_exclusive_group()
+    format_group.add_argument(
+        "--archive-format",
+        choices=["vortex", "lance", "parquet"],
+        help="Archive file format (default: parquet)",
+    )
+    format_group.add_argument(
+        "--lance",
+        action="store_true",
+        help="Shortcut for --archive-format lance",
+    )
+    format_group.add_argument(
+        "--vortex",
+        action="store_true",
+        help="Shortcut for --archive-format vortex",
+    )
 
     args = parser.parse_args()
 
@@ -160,4 +342,11 @@ if __name__ == "__main__":
         print(f"SQLite database not found at {sqlite_path}")
         exit(1)
 
-    migrate_sqlite_to_pgembed(sqlite_path, args.dbpath)
+    archive_format = (
+        "lance"
+        if args.lance
+        else ("vortex" if args.vortex else (args.archive_format or "parquet"))
+    )
+    migrate_sqlite_to_pgembed(
+        sqlite_path, args.dbpath, args.duckdb_age_days, archive_format=archive_format
+    )
