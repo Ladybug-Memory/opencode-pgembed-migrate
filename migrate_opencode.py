@@ -1,4 +1,5 @@
 import argparse
+import datetime
 import os
 import pgembed
 import sqlalchemy as sa
@@ -39,44 +40,45 @@ def migrate_sqlite_to_pgembed(sqlite_path, pgdata_path):
         with pg_engine.connect() as conn:
             conn.execute(sa.text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
 
-        # Create tables in PostgreSQL
-        metadata.create_all(pg_engine)
+        # Identify partitioned tables
+        partitioned_tables = ["session", "message"]
 
-        # Ensure all columns are nullable
+        # Create non-partitioned tables first
+        regular_metadata = sa.MetaData()
+        for table_name, table in metadata.tables.items():
+            if table_name not in partitioned_tables:
+                table.tometadata(regular_metadata)
+
+        regular_metadata.create_all(pg_engine)
+
+        # Create partitioned tables manually with proper structure
         with pg_engine.connect() as conn:
-            for table_name, table in metadata.tables.items():
-                if table_name.startswith("__drizzle"):
-                    continue
-                # Drop primary key if exists
-                conn.execute(
-                    sa.text(
-                        f"ALTER TABLE {table_name} DROP CONSTRAINT IF EXISTS {table_name}_pkey CASCADE"
-                    )
-                )
-                for col in table.columns:
-                    conn.execute(
-                        sa.text(
-                            f'ALTER TABLE {table_name} ALTER COLUMN "{col.name}" DROP NOT NULL'
-                        )
-                    )
+            for table_name in partitioned_tables:
+                if table_name in metadata.tables:
+                    table = metadata.tables[table_name]
+                    columns_sql = []
+                    for col in table.columns:
+                        col_type = col.type
+                        if isinstance(col_type, sa.Integer):
+                            col_type = sa.BigInteger()
+                        if col.name == "time_created":
+                            col_type = sa.TIMESTAMP()
+                        elif col.name in [
+                            "time_updated",
+                            "time_compacting",
+                            "time_archived",
+                        ]:
+                            col_type = sa.TIMESTAMP()
+                        columns_sql.append(f'"{col.name}" {col_type}')
 
-        # Partition session table by date if exists
-        if "session" in metadata.tables:
-            session_table = metadata.tables["session"]
-            if "created_at" in session_table.columns:
-                with pg_engine.connect() as conn:
-                    conn.execute(
-                        sa.text("ALTER TABLE session DETACH PARTITION session_default;")
-                    )  # in case
-                    conn.execute(sa.text("DROP TABLE IF EXISTS session_default;"))
-                    conn.execute(
-                        sa.text("ALTER TABLE session PARTITION BY RANGE (created_at);")
-                    )
-                    conn.execute(
-                        sa.text(
-                            "CREATE TABLE session_default PARTITION OF session DEFAULT;"
-                        )
-                    )
+                    create_sql = f"""CREATE TABLE {table_name} (
+                        {', '.join(columns_sql)}
+                    ) PARTITION BY RANGE (time_created)"""
+                    conn.execute(sa.text(create_sql))
+
+                    # Create default partition
+                    conn.execute(sa.text(f"""CREATE TABLE {table_name}_default
+                        PARTITION OF {table_name} DEFAULT"""))
 
         # Copy data for each table
         with pg_engine.connect() as conn:
@@ -98,7 +100,24 @@ def migrate_sqlite_to_pgembed(sqlite_path, pgdata_path):
                                 row_dict.pop(col.name, None)
                         if "id" in row_dict and row_dict["id"] is None:
                             row_dict.pop("id")
+                        # Convert bigint timestamps to datetime for partitioned tables
+                        if table_name in partitioned_tables:
+                            for ts_col in [
+                                "time_created",
+                                "time_updated",
+                                "time_compacting",
+                                "time_archived",
+                            ]:
+                                if ts_col in row_dict and row_dict[ts_col] is not None:
+                                    row_dict[ts_col] = datetime.datetime.fromtimestamp(
+                                        row_dict[ts_col] / 1000.0
+                                    )
                         for col_name, value in list(row_dict.items()):
+                            # Clean null bytes from string values
+                            if isinstance(value, str):
+                                row_dict[col_name] = value.replace("\x00", "").replace(
+                                    "\\u0000", ""
+                                )
                             if value is None and not table.columns[col_name].nullable:
                                 if isinstance(table.columns[col_name].type, sa.String):
                                     row_dict[col_name] = ""
